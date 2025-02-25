@@ -1,0 +1,274 @@
+From 74da76b96108ec687f4163622e863052e0b6ea28 Mon Sep 17 00:00:00 2001
+From: Dennis Langenkamp <dennis.langenkamp@alliedvision.com>
+Date: Tue, 25 Feb 2025 15:38:56 +0100
+Subject: [PATCH] staging: media: imx: fix avt patch issues for linux 6.6
+
+This commit fixes issue the are indrouced by appling the avt patches on the linux 6.6 driver.
+---
+ drivers/staging/media/imx/imx8-isi-cap.c      | 57 ++++++++++++-------
+ .../staging/media/imx/imx8-mipi-csi2-sam.c    | 44 +++++++++++---
+ 2 files changed, 73 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/staging/media/imx/imx8-isi-cap.c b/drivers/staging/media/imx/imx8-isi-cap.c
+index 238a87c7b690..1afd60e63f6b 100644
+--- a/drivers/staging/media/imx/imx8-isi-cap.c
++++ b/drivers/staging/media/imx/imx8-isi-cap.c
+@@ -433,7 +433,7 @@ static int cap_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ 
+ 	if (!isi_cap->is_streaming[isi_cap->id] &&
+ 	    q->start_streaming_called) {
+-		mxc_isi_channel_enable(mxc_isi, mxc_isi->m2m_enabled);
++		mxc_isi_channel_enable_loc(mxc_isi, mxc_isi->m2m_enabled);
+ 		ret = mxc_isi_pipeline_enable(isi_cap, 1);
+ 		if (ret < 0 && ret != -ENOIOCTLCMD)
+ 			goto disable;
+@@ -445,7 +445,7 @@ static int cap_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	return 0;
+ 
+ 	disable:
+-	mxc_isi_channel_disable(mxc_isi);
++	mxc_isi_channel_disable_loc(mxc_isi);
+ 
+ 	err:
+ 	spin_lock_irqsave(&isi_cap->slock, flags);
+@@ -937,7 +937,7 @@ static int mxc_isi_cap_enum_fmt(struct file *file, void *priv,
+ 				struct v4l2_fmtdesc *f)
+ {
+ 	struct mxc_isi_cap_dev *isi_cap = video_drvdata(file);
+-	struct mxc_isi_fmt *fmt;
++	const struct mxc_isi_fmt *fmt;
+ 	int err;
+ 
+ 	dev_dbg(&isi_cap->pdev->dev, "%s\n", __func__);
+@@ -971,13 +971,16 @@ static int mxc_isi_cap_enum_fmt(struct file *file, void *priv,
+ 			goto err_free;
+ 		}
+ 
+-		sd_state = v4l2_subdev_alloc_state(src_sd);
++		sd_state = v4l2_subdev_lock_and_get_active_state(src_sd);
+ 
+ 		if (!sd_state) {
++			v4l2_err(&isi_cap->sd,
++				 "%s, Get active state failed\n", __func__);
+ 			err = -ENOMEM;
+ 			goto err_free;
+ 		}
+ 
++
+ 		for (i = 0,j = 0;i < mxc_isi_out_formats_size;i++)
+ 		{
+ 			int ret;
+@@ -992,12 +995,15 @@ static int mxc_isi_cap_enum_fmt(struct file *file, void *priv,
+ 			{
+ 				isi_cap->avail_fmts[j] = &mxc_isi_out_formats[i];
+ 				j++;
++			} else if (ret) {
++				v4l2_err(&isi_cap->sd,
++				 "%s, set_fmt call failed with %d\n", __func__, ret);
+ 			}
+ 		}
+ 
+ 		isi_cap->avail_fmts_cnt = j;
+ 
+-		v4l2_subdev_free_state(sd_state);
++		v4l2_subdev_unlock_state(sd_state);
+ 	}
+ 
+ 	if (f->index >= (int)isi_cap->avail_fmts_cnt)
+@@ -1048,11 +1054,9 @@ static int mxc_isi_cap_g_fmt_mplane(struct file *file, void *fh,
+ }
+ 
+ 
+-static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+-				      struct v4l2_format *f)
++static struct mxc_isi_fmt *mxc_isi_cap_fmt_try(struct mxc_isi_cap_dev *isi_cap,
++				      struct v4l2_pix_format_mplane *pix)
+ {
+-	struct mxc_isi_cap_dev *isi_cap = video_drvdata(file);
+-	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
+ 	struct v4l2_subdev_format src_fmt;
+ 	struct v4l2_subdev_state *sd_state;
+ 	struct media_pad *source_pad;
+@@ -1080,16 +1084,21 @@ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+ 	if (!source_pad) {
+ 		v4l2_err(&isi_cap->sd,
+ 			 "%s, No remote pad found!\n", __func__);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto err;
+ 	}
+ 
+ 	src_sd = mxc_get_remote_subdev(&isi_cap->sd, __func__);
+-	if (!src_sd)
+-		return -EINVAL;
++	if (!src_sd) {
++		ret = -EINVAL;
++		goto err;
++	}
+ 
+-	sd_state = v4l2_subdev_alloc_state(src_sd);
+-	if (!sd_state)
+-		return -ENOMEM;
++	sd_state = v4l2_subdev_lock_and_get_active_state(src_sd);
++	if (!sd_state) {
++		ret = -EINVAL;
++		goto err;
++	}
+ 
+ 	src_fmt.pad = source_pad->index;
+ 	src_fmt.which = V4L2_SUBDEV_FORMAT_TRY;
+@@ -1115,7 +1124,7 @@ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+ 			v4l_bound_align_image(&pix->width, 16, ISI_4K * 3, fmt->align,
+ 					      &pix->height, 1, ISI_8K, 0, 0);
+ 		else
+-        		v4l_bound_align_image(&pix->width, 16, ISI_8K, fmt->align,
++        		v4l_bound_align_image(&pix->width, 16, ISI_4K, fmt->align,
+ 					      &pix->height, 16, ISI_8K, 0, 0);
+ 
+ 	pix->num_planes = fmt->memplanes;
+@@ -1142,7 +1151,7 @@ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+ 		}
+ 	}
+ 
+-	v4l2_subdev_free_state(sd_state);
++	v4l2_subdev_unlock_state(sd_state);
+ 
+ 	if (fmt->colplanes != fmt->memplanes) {
+ 		for (i = 1; i < fmt->colplanes; ++i) {
+@@ -1155,6 +1164,9 @@ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+ 	}
+ 
+ 	return fmt;
++
++err: 
++	return ERR_PTR(ret);
+ }
+ 
+ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+@@ -1162,8 +1174,12 @@ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+ {
+ 	struct mxc_isi_cap_dev *isi_cap = video_drvdata(file);
+ 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++	struct mxc_isi_fmt *ret;
++
++	ret = mxc_isi_cap_fmt_try(isi_cap, pix);
++	if (IS_ERR(ret)) 
++		return PTR_ERR(ret);
+ 
+-	mxc_isi_cap_fmt_try(isi_cap, pix);
+ 	return 0;
+ }
+ 
+@@ -1240,7 +1256,6 @@ static int mxc_isi_cap_s_fmt_mplane(struct file *file, void *priv,
+ 	struct media_pad *source_pad;
+ 	struct v4l2_subdev *src_sd;
+ 	struct v4l2_subdev_format src_fmt = { 0 };
+-	int bpl;
+ 	int i, ret;
+ 
+ 	/* Step1: Check format with output support format list.
+@@ -1257,7 +1272,7 @@ static int mxc_isi_cap_s_fmt_mplane(struct file *file, void *priv,
+ 		return -EBUSY;
+ 
+ 	fmt = mxc_isi_cap_fmt_try(isi_cap, pix);
+-	if (!fmt)
++	if (IS_ERR(fmt))
+ 		fmt = &mxc_isi_out_formats[0];
+ 
+ 	dst_f->fmt = fmt;
+@@ -1766,6 +1781,8 @@ static int mxc_isi_subdev_set_fmt(struct v4l2_subdev *sd,
+ 	struct mxc_isi_frame *dst_f = &isi_cap->dst_f;
+ 	struct mxc_isi_fmt *out_fmt;
+ 	int i;
++	
++	v4l2_info(&isi_cap->sd, "%s\n", __func__);
+ 
+ 	if (fmt->pad < MXC_ISI_SD_PAD_SOURCE_MEM &&
+ 	    vb2_is_busy(&isi_cap->vb2_q))
+diff --git a/drivers/staging/media/imx/imx8-mipi-csi2-sam.c b/drivers/staging/media/imx/imx8-mipi-csi2-sam.c
+index 3b82a16e63bd..8ee645031b81 100644
+--- a/drivers/staging/media/imx/imx8-mipi-csi2-sam.c
++++ b/drivers/staging/media/imx/imx8-mipi-csi2-sam.c
+@@ -1184,7 +1184,8 @@ static int mipi_csis_set_fmt(struct v4l2_subdev *mipi_sd,
+ 	struct csis_pix_format const *csis_fmt;
+ 	struct media_pad *source_pad;
+ 	struct v4l2_subdev *sen_sd;
+-	int ret;
++	struct v4l2_subdev_state *sen_state = NULL;
++	int ret = 0;
+ 
+ 	/* Get remote source pad */
+ 	source_pad = csis_get_remote_sensor_pad(state);
+@@ -1200,22 +1201,42 @@ static int mipi_csis_set_fmt(struct v4l2_subdev *mipi_sd,
+ 		return -EINVAL;
+ 	}
+ 
++	if (format->which == V4L2_SUBDEV_FORMAT_TRY) {
++		sen_state = v4l2_subdev_lock_and_get_active_state(sen_sd);
++
++		if (!sen_state) {
++			v4l2_err(&state->sd, "%s, Failed to get active state!\n", __func__);
++			return -EINVAL;
++		}
++			
++	}
++
+ 	format->pad = source_pad->index;
+-	ret = v4l2_subdev_call(sen_sd, pad, set_fmt, NULL, format);
++	ret = v4l2_subdev_call(sen_sd, pad, set_fmt, sen_state, format);
+ 	if (ret < 0) {
+ 		v4l2_err(&state->sd, "%s, set sensor format fail\n", __func__);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto exit;
+ 	}
+ 
+ 	csis_fmt = find_csis_format(mf->code);
+-	if (!csis_fmt) {
+-		csis_fmt = &mipi_csis_formats[0];
+-		mf->code = csis_fmt->code;
++	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
++		if (!csis_fmt) {
++			csis_fmt = &mipi_csis_formats[0];
++			mf->code = csis_fmt->code;
++		}
++
++		state->csis_fmt = csis_fmt;
++	} else if (!csis_fmt) {
++		ret = -EINVAL;
+ 	}
+ 
+-	state->csis_fmt = csis_fmt;
+ 
+-	return 0;
++exit:
++	if (sen_state)
++		v4l2_subdev_unlock_state(sen_state);
++
++	return ret;
+ }
+ 
+ static int mipi_csis_get_fmt(struct v4l2_subdev *mipi_sd,
+@@ -2095,8 +2116,14 @@ static int mipi_csis_probe(struct platform_device *pdev)
+ 	memcpy(state->events, mipi_csis_events, sizeof(state->events));
+ 	state->sd.entity.ops = &mipi_csi2_sd_media_ops;
+ 
++	ret = v4l2_subdev_init_finalize(mipi_sd);
++	if (ret < 0)
++		return ret;
++
+ 	pm_runtime_enable(dev);
+ 
++
++
+ 	dev_info(&pdev->dev, "lanes: %d, hs_settle: %d, clk_settle: %d, wclk: %d, freq: %u\n",
+ 		 state->num_lanes, state->hs_settle, state->clk_settle,
+ 		 state->wclk_ext, state->clk_frequency);
+@@ -2160,6 +2187,7 @@ static int mipi_csis_remove(struct platform_device *pdev)
+ 	struct csi_state *state = platform_get_drvdata(pdev);
+ 
+ 	media_entity_cleanup(&state->sd.entity);
++	v4l2_subdev_cleanup(&state->sd);
+ 	pm_runtime_disable(&pdev->dev);
+ 
+ 	return 0;

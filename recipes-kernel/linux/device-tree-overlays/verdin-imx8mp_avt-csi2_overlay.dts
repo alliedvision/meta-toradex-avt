@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Copyright 2025 Alliede Vision Technologies GmbH
+ */
+
+#define AVT_LINK_FREQUENCY 		    681250000
+#define CSI_ASSIGNED_CLOCK_RATES	500000000
+#define CSI_DATA_LANES 				4
+#define CSIS_HS_SETTLE				14
+#define CSIS_CLK_SETTLE				2
+
+/ {
+    compatible = "toradex,verdin-imx8mp";
+};
+
+/* Verdin I2C_4_CSI */
+&i2c3 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_i2c3>;
+	clock-frequency = <400000>;
+
+	avt_csi2: avt_csi2@3c {
+        status = "okay";
+            
+		compatible = "alliedvision,avt_csi2"; /*"alliedvision,avt_csi2";*/
+		reg = <0x3c>;
+
+		streamon_delay = <80>; 
+
+        avt,max-width = <4096>;
+
+		port {
+			avt_mipi_ep_0: endpoint {
+				data-lanes = <1 2 3 4>;
+				clock-lanes = <0>;
+				link-frequencies = /bits/ 64 <AVT_LINK_FREQUENCY>;
+				/*max-pixel-frequency = /bits/ 64 <266000000>;*/
+				remote-endpoint = <&mipi_csi0_ep>;
+			};
+		};
+	};
+};
+
+&isi_0 {
+	/*assigned-clock-rates = <750000000>, <500000000>;*/
+	status = "okay";
+	disable_resolution_check;
+    dma-coherent;
+
+	cap_device {
+		status = "okay";
+	};
+};
+
+
+&mipi_csi_0 {
+  	status = "okay";
+	clock-frequency = <AVT_LINK_FREQUENCY>;
+	assigned-clock-rates = <CSI_ASSIGNED_CLOCK_RATES>;
+
+	port@0 {
+		mipi_csi0_ep: endpoint {
+			remote-endpoint = <&avt_mipi_ep_0>;
+			data-lanes = <CSI_DATA_LANES>;
+			csis-hs-settle = <CSIS_HS_SETTLE>;
+			csis-clk-settle = <CSIS_CLK_SETTLE>;
+			csis-wclk;
+		};
+	};
+};
+
+&cameradev {
+	status = "okay";
+};
+
+
+&{/} {
+    avt_csitl: avt_csitl {
+        supported_data_types = [ 2a ];
+        min_announced_frames = <3>;
+
+        ipu {
+            y_min = <1>;
+            y_inc = <1>;
+            y_max = <8192>;
+            x_min = <16>;
+            x_inc = <12>;
+            x_max = <12288>;
+        };
+    };
+
+  
+	reserved-memory {
+		linux,cma {
+			size = <0 0x40000000>;
+		};
+	};
+};

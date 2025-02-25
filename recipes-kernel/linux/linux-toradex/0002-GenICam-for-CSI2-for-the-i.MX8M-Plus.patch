@@ -1,0 +1,809 @@
+From b6c0ae7b2a4e6d66db6c1f1992e032f4ba4fc73a Mon Sep 17 00:00:00 2001
+From: Dennis Langenkamp <dennis.langenkamp@alliedvision.com>
+Date: Wed, 15 Mar 2023 11:24:42 +0100
+Subject: [PATCH] GenICam for CSI2 for the i.MX8M Plus
+
+- Fixed stream start not working, if buffers were only queued after streamon was called.
+- Added custom format for GenICam for CSI2. Internally the imx8mp driver uses RGB24 for the genicam data format to have a quicker processing of the data. Therefore, the width of the data has to be adjusted by the driver.
+- Added v4l2 to enable/disable dropping of the first frame. Default value is disabled.
+---
+ drivers/staging/media/imx/imx8-isi-cap.c      | 151 ++++++--
+ drivers/staging/media/imx/imx8-isi-core.h     |   2 +
+ drivers/staging/media/imx/imx8-isi-fmt.c      | 336 +++++++++++++-----
+ drivers/staging/media/imx/imx8-isi-fmt.h      |   3 +
+ .../staging/media/imx/imx8-mipi-csi2-sam.c    |  68 +++-
+ include/uapi/linux/media-bus-format.h         |   3 +-
+ 6 files changed, 441 insertions(+), 122 deletions(-)
+
+diff --git a/drivers/staging/media/imx/imx8-isi-cap.c b/drivers/staging/media/imx/imx8-isi-cap.c
+index d14d55849610..54b45e2e6801 100644
+--- a/drivers/staging/media/imx/imx8-isi-cap.c
++++ b/drivers/staging/media/imx/imx8-isi-cap.c
+@@ -54,7 +54,15 @@ struct mxc_isi_fmt mxc_isi_src_formats[] = {
+ 		.memplanes	= 1,
+ 		.colplanes	= 1,
+ 		.align		= 2,
+-	}
++	},
++	{
++		.name		= "AVT G4C2",
++		.fourcc		= V4L2_PIX_FMT_CUSTOM,
++		.depth		= { 8 },
++		.memplanes	= 1,
++		.colplanes	= 1,
++		.align		= 2,
++	},
+ };
+ 
+ static struct v4l2_subdev *mxc_get_remote_subdev(struct v4l2_subdev *subdev,
+@@ -394,12 +402,22 @@ static int cap_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	list_add_tail(&isi_cap->buf_discard[1].list, &isi_cap->out_discard);
+ 
+ 	/* ISI channel output buffer 1 */
+-	buf = list_first_entry(&isi_cap->out_discard, struct mxc_isi_buffer, list);
++	if (mxc_isi->discard_first_frame)
++		buf = list_first_entry(&isi_cap->out_discard,
++				       struct mxc_isi_buffer, list);
++	else
++		buf = list_first_entry(&isi_cap->out_pending,
++				       struct mxc_isi_buffer, list);
++
+ 	buf->v4l2_buf.sequence = 0;
+ 	vb2 = &buf->v4l2_buf.vb2_buf;
+ 	vb2->state = VB2_BUF_STATE_ACTIVE;
+ 	mxc_isi_channel_set_outbuf_loc(mxc_isi, buf);
+-	list_move_tail(isi_cap->out_discard.next, &isi_cap->out_active);
++
++	if (mxc_isi->discard_first_frame)
++		list_move_tail(isi_cap->out_discard.next, &isi_cap->out_active);
++	else
++		list_move_tail(isi_cap->out_pending.next, &isi_cap->out_active);
+ 
+ 	/* ISI channel output buffer 2 */
+ 	buf = list_first_entry(&isi_cap->out_pending, struct mxc_isi_buffer, list);
+@@ -413,8 +431,22 @@ static int cap_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	isi_cap->frame_count = 1;
+ 	spin_unlock_irqrestore(&isi_cap->slock, flags);
+ 
++	if (!isi_cap->is_streaming[isi_cap->id] &&
++	    q->start_streaming_called) {
++		mxc_isi_channel_enable(mxc_isi, mxc_isi->m2m_enabled);
++		ret = mxc_isi_pipeline_enable(isi_cap, 1);
++		if (ret < 0 && ret != -ENOIOCTLCMD)
++			goto disable;
++
++		isi_cap->is_streaming[isi_cap->id] = 1;
++		mxc_isi->is_streaming = 1;
++	}
++
+ 	return 0;
+ 
++disable:
++	mxc_isi_channel_disable(mxc_isi);
++
+ err:
+ 	spin_lock_irqsave(&isi_cap->slock, flags);
+ 	while (!list_empty(&isi_cap->out_active)) {
+@@ -515,6 +547,8 @@ static const char * const test_pattern_menu[] = {
+ 	"Color squares w/ rolling bar",
+ };
+ 
++#define MXC_ISI_CID_DISCARD_FIRST_FRAME V4L2_CID_USER_IMX_BASE+9
++
+ static int mxc_isi_s_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct mxc_isi_cap_dev *isi_cap = ctrl_to_isi_cap(ctrl);
+@@ -548,7 +582,9 @@ static int mxc_isi_s_ctrl(struct v4l2_ctrl *ctrl)
+ 		mxc_isi->alpha = ctrl->val;
+ 		mxc_isi->alphaen = 1;
+ 		break;
+-
++	case MXC_ISI_CID_DISCARD_FIRST_FRAME:
++		mxc_isi->discard_first_frame = ctrl->val;
++		break;
+ 	case V4L2_CID_TEST_PATTERN:
+ 		if (ctrl->val < 0)
+ 			return -EINVAL;
+@@ -573,6 +609,19 @@ static const struct v4l2_ctrl_ops mxc_isi_ctrl_ops = {
+ 	.s_ctrl = mxc_isi_s_ctrl,
+ };
+ 
++static const struct v4l2_ctrl_config mxc_isi_ctrl_configs[] = {
++	{
++		.ops = &mxc_isi_ctrl_ops,
++		.id = MXC_ISI_CID_DISCARD_FIRST_FRAME,
++		.name = "discard first frame",
++		.type = V4L2_CTRL_TYPE_BOOLEAN,
++		.min = 0,
++		.max = 1,
++		.step = 1,
++		.def = 0,
++	}
++};
++
+ int mxc_isi_ctrls_create(struct mxc_isi_cap_dev *isi_cap)
+ {
+ 	struct mxc_isi_ctrls *ctrls = &isi_cap->ctrls;
+@@ -595,6 +644,12 @@ int mxc_isi_ctrls_create(struct mxc_isi_cap_dev *isi_cap)
+ 					     ARRAY_SIZE(test_pattern_menu) - 1,
+ 					     0, 0, test_pattern_menu);
+ 
++	ctrls->alpha = v4l2_ctrl_new_std(handler, &mxc_isi_ctrl_ops,
++					 V4L2_CID_ALPHA_COMPONENT,
++					 0, 0xff, 1, 0);
++
++	ctrls->discard_first_frame = v4l2_ctrl_new_custom(handler,&mxc_isi_ctrl_configs[0],NULL);
++
+ 	if (!handler->error)
+ 		ctrls->ready = true;
+ 
+@@ -865,7 +920,10 @@ static int mxc_isi_cap_g_fmt_mplane(struct file *file, void *fh,
+ 
+ 	dev_dbg(&isi_cap->pdev->dev, "%s\n", __func__);
+ 
+-	pix->width = dst_f->o_width;
++	if (dst_f->fmt->fourcc == V4L2_PIX_FMT_CUSTOM)
++		pix->width = dst_f->o_width * 3;
++	else
++		pix->width = dst_f->o_width;
+ 	pix->height = dst_f->o_height;
+ 	pix->field = V4L2_FIELD_NONE;
+ 	pix->pixelformat = dst_f->fmt->fourcc;
+@@ -902,16 +960,47 @@ mxc_isi_cap_fmt_try(struct mxc_isi_cap_dev *isi_cap,
+ 		v4l2_warn(&isi_cap->sd, "Not match format, set default\n");
+ 	}
+ 
+-	/*
+-	 * The bit width in CHNL_IMG_CFG[HEIGHT/WIDTH] is 13, so the maximum
+-	 * theorical value for image width/height should be 8K, but due to ISI
+-	 * line buffer size limitation, the maximum value is 4K
+-	 *
+-	 * For efficient data transmission, the minimum data width should be
+-	 * 16(128/8)
+-	 */
+-	v4l_bound_align_image(&pix->width, 16, ISI_4K, fmt->align,
+-			      &pix->height, 16, ISI_4K, 1, 0);
++
++    source_pad = mxc_isi_get_remote_source_pad(&isi_cap->sd);
++    if (!source_pad) {
++        v4l2_err(&isi_cap->sd,
++                 "%s, No remote pad found!\n", __func__);
++        return -EINVAL;
++    }
++
++    src_sd = mxc_get_remote_subdev(&isi_cap->sd, __func__);
++    if (!src_sd)
++        return -EINVAL;
++
++    sd_state = v4l2_subdev_alloc_state(src_sd);
++    if (!sd_state)
++        return -ENOMEM;
++
++    src_fmt.pad = source_pad->index;
++    src_fmt.which = V4L2_SUBDEV_FORMAT_TRY;
++    src_fmt.format.code = fmt->mbus_code;
++    v4l2_fill_mbus_format_mplane(&src_fmt.format,pix);
++    ret = v4l2_subdev_call(src_sd, pad, set_fmt, sd_state, &src_fmt);
++    if (ret < 0 && ret != -ENOIOCTLCMD)
++    {
++        v4l2_err(&isi_cap->sd, "try remote fmt fail!\n");
++    }
++    else
++    {
++        /*
++         * The bit width in CHNL_IMG_CFG[HEIGHT/WIDTH] is 13, so the maximum
++         * theorical value for image width/height should be 8K, but due to ISI
++         * line buffer size limitation, the maximum value is 4K
++         *
++         * For efficient data transmission, the minimum data width should be
++         * 16(128/8)
++         */
++	if (pix->pixelformat == V4L2_PIX_FMT_CUSTOM)
++		v4l_bound_align_image(&pix->width, 16, ISI_4K * 3, fmt->align,
++					      &pix->height, 16, ISI_8K, 0, 0);
++	else
++        	v4l_bound_align_image(&pix->width, 16, ISI_8K, fmt->align,
++                              &pix->height, 16, ISI_8K, 0, 0);
+ 
+ 	pix->num_planes = fmt->memplanes;
+ 	pix->pixelformat = fmt->fourcc;
+@@ -986,8 +1075,11 @@ static int mxc_isi_source_fmt_init(struct mxc_isi_cap_dev *isi_cap)
+ 
+ 	src_fmt.pad = source_pad->index;
+ 	src_fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+-	src_fmt.format.code = MEDIA_BUS_FMT_UYVY8_1X16;
+-	src_fmt.format.width = dst_f->width;
++	src_fmt.format.code = dst_f->fmt->mbus_code;
++	if (dst_f->fmt->fourcc == V4L2_PIX_FMT_CUSTOM)
++		src_fmt.format.width = dst_f->width * 3;
++	else
++		src_fmt.format.width = dst_f->width;
+ 	src_fmt.format.height = dst_f->height;
+ 	ret = v4l2_subdev_call(src_sd, pad, set_fmt, NULL, &src_fmt);
+ 	if (ret < 0 && ret != -ENOIOCTLCMD) {
+@@ -1005,9 +1097,11 @@ static int mxc_isi_source_fmt_init(struct mxc_isi_cap_dev *isi_cap)
+ 	}
+ 
+ 	/* Pixel link master will transfer format to RGB32 or YUV32 */
+-	src_f->fmt = mxc_isi_get_src_fmt(&src_fmt);
+-
+-	set_frame_bounds(src_f, src_fmt.format.width, src_fmt.format.height);
++    	src_f->fmt = dst_f->fmt;
++	if (dst_f->fmt->fourcc == V4L2_PIX_FMT_CUSTOM)
++		set_frame_bounds(src_f, src_fmt.format.width / 3, src_fmt.format.height);
++	else
++		set_frame_bounds(src_f, src_fmt.format.width, src_fmt.format.height);
+ 
+ 	if (dst_f->width > src_f->width || dst_f->height > src_f->height) {
+ 		dev_err(&isi_cap->pdev->dev,
+@@ -1048,16 +1142,23 @@ static int mxc_isi_cap_s_fmt_mplane(struct file *file, void *priv,
+ 		fmt = &mxc_isi_out_formats[0];
+ 
+ 	dst_f->fmt = fmt;
+-	dst_f->width = pix->width;
+ 	dst_f->height = pix->height;
+ 
++	if (fmt->fourcc == V4L2_PIX_FMT_CUSTOM)
++		dst_f->width = pix->width / 3;
++	else
++		dst_f->width = pix->width;
++
+ 	for (i = 0; i < pix->num_planes; i++) {
+ 		dst_f->bytesperline[i] = pix->plane_fmt[i].bytesperline;
+ 		dst_f->sizeimage[i]    = pix->plane_fmt[i].sizeimage;
+ 	}
+ 
+ 	memcpy(&isi_cap->pix, pix, sizeof(*pix));
+-	set_frame_bounds(dst_f, pix->width, pix->height);
++	if (fmt->fourcc == V4L2_PIX_FMT_CUSTOM)
++		set_frame_bounds(dst_f, pix->width / 3, pix->height);
++	else
++		set_frame_bounds(dst_f, pix->width, pix->height);
+ 
+ 	return 0;
+ }
+@@ -1199,6 +1300,9 @@ static int mxc_isi_cap_g_selection(struct file *file, void *fh,
+ 	    s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+ 		return -EINVAL;
+ 
++	if (f->fmt->fourcc == V4L2_PIX_FMT_CUSTOM)
++		return -ENODATA;
++
+ 	switch (s->target) {
+ 	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+ 	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+@@ -1251,6 +1355,9 @@ static int mxc_isi_cap_s_selection(struct file *file, void *fh,
+ 	else
+ 		return -EINVAL;
+ 
++	if (f->fmt->fourcc == V4L2_PIX_FMT_CUSTOM)
++		return -ENODATA;
++
+ 	bounds_adjust(f, &rect);
+ 
+ 	if (s->flags & V4L2_SEL_FLAG_LE &&
+diff --git a/drivers/staging/media/imx/imx8-isi-core.h b/drivers/staging/media/imx/imx8-isi-core.h
+index de90cb284c31..cb38af787671 100644
+--- a/drivers/staging/media/imx/imx8-isi-core.h
++++ b/drivers/staging/media/imx/imx8-isi-core.h
+@@ -143,6 +143,7 @@ struct mxc_isi_ctrls {
+ 	struct v4l2_ctrl *test_pattern;
+ 	struct v4l2_ctrl *num_cap_buf;
+ 	struct v4l2_ctrl *num_out_buf;
++	struct v4l2_ctrl *discard_first_frame;
+ 	bool ready;
+ };
+ 
+@@ -406,6 +407,7 @@ struct mxc_isi_dev {
+ 	unsigned int crop:1;
+ 	unsigned int deinterlace:3;
+ 	unsigned int is_streaming:1;
++	unsigned int discard_first_frame:1;
+ };
+ 
+ static inline void set_frame_bounds(struct mxc_isi_frame *f,
+diff --git a/drivers/staging/media/imx/imx8-isi-fmt.c b/drivers/staging/media/imx/imx8-isi-fmt.c
+index db11c809a3d3..3fc316a52ab5 100644
+--- a/drivers/staging/media/imx/imx8-isi-fmt.c
++++ b/drivers/staging/media/imx/imx8-isi-fmt.c
+@@ -5,99 +5,265 @@
+  */
+ 
+ #include "imx8-isi-core.h"
++#include "imx8-isi-fmt.h"
+ 
+ struct mxc_isi_fmt mxc_isi_out_formats[] = {
+-	{
+-		.name		= "RGB565",
+-		.fourcc		= V4L2_PIX_FMT_RGB565,
+-		.depth		= { 16 },
+-		.color		= MXC_ISI_OUT_FMT_RGB565,
+-		.memplanes	= 1,
+-		.colplanes	= 1,
+-		.align		= 3,
+-		.mbus_code  = MEDIA_BUS_FMT_RGB565_1X16,
+-	}, {
+-		.name		= "RGB24",
+-		.fourcc		= V4L2_PIX_FMT_RGB24,
+-		.depth		= { 24 },
+-		.color		= MXC_ISI_OUT_FMT_BGR32P,
+-		.memplanes	= 1,
+-		.colplanes	= 1,
+-		.align		= 2,
+-		.mbus_code  = MEDIA_BUS_FMT_RGB888_1X24,
+-	}, {
+-		.name		= "BGR24",
+-		.fourcc		= V4L2_PIX_FMT_BGR24,
+-		.depth		= { 24 },
+-		.color		= MXC_ISI_OUT_FMT_RGB32P,
+-		.memplanes	= 1,
+-		.colplanes	= 1,
++        {
++                .name		= "RGB565",
++                .fourcc		= V4L2_PIX_FMT_RGB565,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RGB565,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code  = MEDIA_BUS_FMT_RGB888_1X24,
++        }, {
++                .name		= "RGB24",
++                .fourcc		= V4L2_PIX_FMT_RGB24,
++                .depth		= { 24 },
++                .color		= MXC_ISI_OUT_FMT_BGR32P,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code  = MEDIA_BUS_FMT_RGB888_1X24,
++        }, {
++                .name		= "BGR24",
++                .fourcc		= V4L2_PIX_FMT_BGR24,
++                .depth		= { 24 },
++                .color		= MXC_ISI_OUT_FMT_RGB32P,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code  = MEDIA_BUS_FMT_RGB888_1X24,
++        }, {
++                .name		= "YUYV-16",
++                .fourcc		= V4L2_PIX_FMT_YUYV,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_YUV422_1P8P,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_UYVY8_2X8,
++        }, {
++                .name		= "YUV32 (X-Y-U-V)",
++                .fourcc		= V4L2_PIX_FMT_YUV32,
++                .depth		= { 32 },
++                .color		= MXC_ISI_OUT_FMT_YUV444_1P8,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_AYUV8_1X32,
++        }, {
++                .name		= "NV12 (YUYV)",
++                .fourcc		= V4L2_PIX_FMT_NV12,
++                .depth		= { 8, 8 },
++                .color		= MXC_ISI_OUT_FMT_YUV420_2P8P,
++                .memplanes	= 1,
++                .colplanes	= 2,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_UYVY8_2X8,
++        }, {
++                .name		= "NV12M (YUYV)",
++                .fourcc		= V4L2_PIX_FMT_NV12M,
++                .depth		= { 8, 8 },
++                .color		= MXC_ISI_OUT_FMT_YUV420_2P8P,
++                .memplanes	= 2,
++                .colplanes	= 2,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_UYVY8_2X8,
++        }, {
++                .name		= "YUV444M (Y-U-V)",
++                .fourcc		= V4L2_PIX_FMT_YUV444M,
++                .depth		= { 8, 8, 8 },
++                .color		= MXC_ISI_OUT_FMT_YUV444_3P8P,
++                .memplanes	= 3,
++                .colplanes	= 3,
+ 		.align		= 2,
+-		.mbus_code  = MEDIA_BUS_FMT_BGR888_1X24,
+-	}, {
+-		.name		= "YUYV-16",
+-		.fourcc		= V4L2_PIX_FMT_YUYV,
+-		.depth		= { 16 },
+-		.color		= MXC_ISI_OUT_FMT_YUV422_1P8P,
+-		.memplanes	= 1,
+-		.colplanes	= 1,
+-		.align		= 3,
+-		.mbus_code	= MEDIA_BUS_FMT_YUYV8_1X16,
+-	}, {
+-		.name		= "YUV32 (X-Y-U-V)",
+-		.fourcc		= V4L2_PIX_FMT_YUV32,
+-		.depth		= { 32 },
+-		.color		= MXC_ISI_OUT_FMT_YUV444_1P8,
+-		.memplanes	= 1,
+-		.colplanes	= 1,
++                .mbus_code	= MEDIA_BUS_FMT_YUV8_1X24,
++        }, {
++                .name		= "xBGR32",
++                .fourcc		= V4L2_PIX_FMT_XBGR32,
++                .depth		= { 32 },
++                .color		= MXC_ISI_OUT_FMT_XRGB32,
++                .memplanes	= 1,
++                .colplanes	= 1,
+ 		.align		= 2,
+-		.mbus_code	= MEDIA_BUS_FMT_AYUV8_1X32,
+-	}, {
+-		.name		= "NV12 (YUYV)",
+-		.fourcc		= V4L2_PIX_FMT_NV12,
+-		.depth		= { 8, 8 },
+-		.color		= MXC_ISI_OUT_FMT_YUV420_2P8P,
+-		.memplanes	= 1,
+-		.colplanes	= 2,
+-		.align		= 4,
+-		.mbus_code	= MEDIA_BUS_FMT_YUYV8_1X16,
+-	}, {
+-		.name		= "NV12M (YUYV)",
+-		.fourcc		= V4L2_PIX_FMT_NV12M,
+-		.depth		= { 8, 8 },
+-		.color		= MXC_ISI_OUT_FMT_YUV420_2P8P,
+-		.memplanes	= 2,
+-		.colplanes	= 2,
+-		.align		= 4,
+-		.mbus_code	= MEDIA_BUS_FMT_YUYV8_1X16,
+-	}, {
+-		.name		= "YUV444M (Y-U-V)",
+-		.fourcc		= V4L2_PIX_FMT_YUV444M,
+-		.depth		= { 8, 8, 8 },
+-		.color		= MXC_ISI_OUT_FMT_YUV444_3P8P,
+-		.memplanes	= 3,
+-		.colplanes	= 3,
+-		.align		= 4,
+-		.mbus_code	= MEDIA_BUS_FMT_YUV8_1X24,
+-	}, {
+-		.name		= "xBGR32",
+-		.fourcc		= V4L2_PIX_FMT_XBGR32,
+-		.depth		= { 32 },
+-		.color		= MXC_ISI_OUT_FMT_XRGB32,
+-		.memplanes	= 1,
+-		.colplanes	= 1,
++                .mbus_code	= MEDIA_BUS_FMT_RGB888_1X24,
++        }, {
++                .name		= "ABGR32",
++                .fourcc		= V4L2_PIX_FMT_ABGR32,
++                .depth		= { 32 },
++                .color		= MXC_ISI_OUT_FMT_ARGB32,
++                .memplanes	= 1,
++                .colplanes	= 1,
+ 		.align		= 2,
+-		.mbus_code	= MEDIA_BUS_FMT_RGB888_1X24,
+-	}, {
+-		.name		= "ABGR32",
+-		.fourcc		= V4L2_PIX_FMT_ABGR32,
+-		.depth		= { 32 },
+-		.color		= MXC_ISI_OUT_FMT_ARGB32,
++                .mbus_code	= MEDIA_BUS_FMT_RGB888_1X24,
++        },
++        //AVT additional format definition
++        //Mono formats
++        {
++                .name		= "MONO8",
++                .fourcc		= V4L2_PIX_FMT_GREY,
++                .depth		= { 8 },
++                .color		= MXC_ISI_OUT_FMT_RAW8,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 1,
++                .mbus_code	= MEDIA_BUS_FMT_Y8_1X8,
++        },
++        {
++                .name		= "MONO10",
++                .fourcc		= V4L2_PIX_FMT_Y10,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW10,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 1,
++                .mbus_code	= MEDIA_BUS_FMT_Y10_1X10,
++        },
++        {
++                .name		= "MONO12",
++                .fourcc		= V4L2_PIX_FMT_Y12,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW12,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 1,
++                .mbus_code	= MEDIA_BUS_FMT_Y12_1X12,
++        },
++        //Bayer 8-bit
++        {
++                .name		= "BGGR8",
++                .fourcc		= V4L2_PIX_FMT_SBGGR8,
++                .depth		= { 8 },
++                .color		= MXC_ISI_OUT_FMT_RAW8,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SBGGR8_1X8,
++        },
++        {
++                .name		= "GBRG8",
++                .fourcc		= V4L2_PIX_FMT_SGBRG8,
++                .depth		= { 8 },
++                .color		= MXC_ISI_OUT_FMT_RAW8,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SGBRG8_1X8,
++        },
++        {
++                .name		= "GRBG8",
++                .fourcc		= V4L2_PIX_FMT_SGRBG8,
++                .depth		= { 8 },
++                .color		= MXC_ISI_OUT_FMT_RAW8,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SGRBG8_1X8,
++        },
++        {
++                .name		= "RGGB8",
++                .fourcc		= V4L2_PIX_FMT_SRGGB8,
++                .depth		= { 8 },
++                .color		= MXC_ISI_OUT_FMT_RAW8,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SRGGB8_1X8,
++        },
++        //Bayer 10-bit
++        {
++                .name		= "BGGR10",
++                .fourcc		= V4L2_PIX_FMT_SBGGR10,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW10,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SBGGR10_1X10,
++        },
++        {
++                .name		= "GBRG10",
++                .fourcc		= V4L2_PIX_FMT_SGBRG10,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW10,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SGBRG10_1X10,
++        },
++        {
++                .name		= "GRBG10",
++                .fourcc		= V4L2_PIX_FMT_SGRBG10,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW10,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SGRBG10_1X10,
++        },
++        {
++                .name		= "RGGB10",
++                .fourcc		= V4L2_PIX_FMT_SRGGB10,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW10,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SRGGB10_1X10,
++        },
++        //Bayer 12-bit
++        {
++                .name		= "BGGR12",
++                .fourcc		= V4L2_PIX_FMT_SBGGR12,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW12,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SBGGR12_1X12,
++        },
++        {
++                .name		= "GBRG12",
++                .fourcc		= V4L2_PIX_FMT_SGBRG12,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW12,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SGBRG12_1X12,
++        },
++        {
++                .name		= "GRBG12",
++                .fourcc		= V4L2_PIX_FMT_SGRBG12,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW12,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SGRBG12_1X12,
++        },
++        {
++                .name		= "RGGB12",
++                .fourcc		= V4L2_PIX_FMT_SRGGB12,
++                .depth		= { 16 },
++                .color		= MXC_ISI_OUT_FMT_RAW12,
++                .memplanes	= 1,
++                .colplanes	= 1,
++                .align		= 2,
++                .mbus_code	= MEDIA_BUS_FMT_SRGGB12_1X12,
++        },
++	{
++		.name		= "TP31",
++		.fourcc		= V4L2_PIX_FMT_CUSTOM,
++		.depth		= { 8 },
++		.color		= MXC_ISI_OUT_FMT_RGB32P,
+ 		.memplanes	= 1,
+ 		.colplanes	= 1,
+ 		.align		= 2,
+-		.mbus_code	= MEDIA_BUS_FMT_RGB888_1X24,
+-	}
++		.mbus_code	= MEDIA_BUS_FMT_CUSTOM,
++	},
+ };
+ 
+ size_t mxc_isi_out_formats_size = ARRAY_SIZE(mxc_isi_out_formats);
+diff --git a/drivers/staging/media/imx/imx8-isi-fmt.h b/drivers/staging/media/imx/imx8-isi-fmt.h
+index d4243943a7b7..7d25dbc2a719 100644
+--- a/drivers/staging/media/imx/imx8-isi-fmt.h
++++ b/drivers/staging/media/imx/imx8-isi-fmt.h
+@@ -6,6 +6,9 @@
+ #ifndef __MXC_ISI_FMT_H__
+ #define __MXC_ISI_FMT_H__
+ 
++#define V4L2_PIX_FMT_CUSTOM    v4l2_fourcc('T', 'P', '3', '1') /* 0x31 mipi datatype  */
++
++
+ extern size_t mxc_isi_out_formats_size;
+ extern struct mxc_isi_fmt mxc_isi_out_formats[];
+ 
+diff --git a/drivers/staging/media/imx/imx8-mipi-csi2-sam.c b/drivers/staging/media/imx/imx8-mipi-csi2-sam.c
+index c6af060c4497..3b82a16e63bd 100644
+--- a/drivers/staging/media/imx/imx8-mipi-csi2-sam.c
++++ b/drivers/staging/media/imx/imx8-mipi-csi2-sam.c
+@@ -520,6 +520,42 @@ static const struct csis_pix_format mipi_csis_formats[] = {
+ 		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RAW12,
+ 		.data_alignment = 16,
+ 	},
++	//AVT additional format definition
++	// Mono formats
++	{
++		.code = MEDIA_BUS_FMT_Y8_1X8,
++		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RAW8,
++		.data_alignment = 8,
++	},
++	{
++		.code = MEDIA_BUS_FMT_Y10_1X10,
++		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RAW10,
++		.data_alignment = 16,
++	},
++	{
++		.code = MEDIA_BUS_FMT_Y12_1X12,
++		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RAW12,
++		.data_alignment = 16,
++	},
++	//Bayer 8-bit
++	{
++		.code = MEDIA_BUS_FMT_SGBRG8_1X8,
++		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RAW8,
++		.data_alignment = 8,
++	}, {
++		.code = MEDIA_BUS_FMT_SGRBG8_1X8,
++		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RAW8,
++		.data_alignment = 8,
++	}, {
++		.code = MEDIA_BUS_FMT_SRGGB8_1X8,
++		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RAW8,
++		.data_alignment = 8,
++	},
++	{
++		.code = MEDIA_BUS_FMT_CUSTOM,
++		.fmt_reg = MIPI_CSIS_ISPCFG_FMT_RGB888,
++		.data_alignment = 24,
++	},
+ };
+ 
+ #define mipi_csis_write(__csis, __r, __v) writel(__v, __csis->regs + __r)
+@@ -746,7 +782,10 @@ static void __mipi_csis_set_format(struct csi_state *state)
+ 	mipi_csis_write(state, MIPI_CSIS_ISPCONFIG_CH0, val);
+ 
+ 	/* Pixel resolution */
+-	val = mf->width | (mf->height << 16);
++	if (mf->code == MEDIA_BUS_FMT_CUSTOM)
++		val = (mf->width / 3) | (mf->height << 16);
++	else
++		val = mf->width | (mf->height << 16);
+ 	mipi_csis_write(state, MIPI_CSIS_ISPRESOL_CH0, val);
+ 
+ 	if (state->hdr) {
+@@ -956,6 +995,7 @@ static void disp_mix_gasket_config(struct csi_state *state)
+ 	u32 val;
+ 
+ 	switch (fmt->code) {
++	case MEDIA_BUS_FMT_CUSTOM:
+ 	case MEDIA_BUS_FMT_RGB888_1X24:
+ 		fmt_val = GASKET_0_CTRL_DATA_TYPE_RGB888;
+ 		break;
+@@ -966,19 +1006,14 @@ static void disp_mix_gasket_config(struct csi_state *state)
+ 	case MEDIA_BUS_FMT_VYUY8_2X8:
+ 		fmt_val = GASKET_0_CTRL_DATA_TYPE_YUV422_8;
+ 		break;
+-	case MEDIA_BUS_FMT_SBGGR8_1X8:
+-		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW8;
+-		break;
+-	case MEDIA_BUS_FMT_SGBRG8_1X8:
+-		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW8;
++	case MEDIA_BUS_FMT_Y8_1X8:
++    	case MEDIA_BUS_FMT_SBGGR8_1X8:
++    	case MEDIA_BUS_FMT_SGBRG8_1X8:
++    	case MEDIA_BUS_FMT_SGRBG8_1X8:
++    	case MEDIA_BUS_FMT_SRGGB8_1X8:
++    		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW8;
+ 		break;
+-	case MEDIA_BUS_FMT_SGRBG8_1X8:
+-		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW8;
+-		break;
+-	case MEDIA_BUS_FMT_SRGGB8_1X8:
+-		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW8;
+-		break;
+-
++	case MEDIA_BUS_FMT_Y10_1X10:
+ 	case MEDIA_BUS_FMT_SBGGR10_1X10:
+ 		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW10;
+ 		break;
+@@ -991,6 +1026,7 @@ static void disp_mix_gasket_config(struct csi_state *state)
+ 	case MEDIA_BUS_FMT_SRGGB10_1X10:
+ 		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW10;
+ 		break;
++	case MEDIA_BUS_FMT_Y12_1X12:
+ 	case MEDIA_BUS_FMT_SBGGR12_1X12:
+ 		fmt_val = GASKET_0_CTRL_DATA_TYPE_RAW12;
+ 		break;
+@@ -1009,6 +1045,7 @@ static void disp_mix_gasket_config(struct csi_state *state)
+ 	}
+ 
+ 	regmap_read(gasket, DISP_MIX_GASKET_0_CTRL, &val);
++	val &= ~(GASKET_0_CTRL_DATA_TYPE_MASK | GASKET_0_CTRL_DUAL_COMP_ENABLE);
+ 	if (fmt_val == GASKET_0_CTRL_DATA_TYPE_YUV422_8)
+ 		val |= GASKET_0_CTRL_DUAL_COMP_ENABLE;
+ 	val |= GASKET_0_CTRL_DATA_TYPE(fmt_val);
+@@ -1017,7 +1054,10 @@ static void disp_mix_gasket_config(struct csi_state *state)
+ 	if (WARN_ON(!mf->width || !mf->height))
+ 		return;
+ 
+-	regmap_write(gasket, DISP_MIX_GASKET_0_HSIZE, mf->width);
++	if (fmt->code == MEDIA_BUS_FMT_CUSTOM)
++		regmap_write(gasket, DISP_MIX_GASKET_0_HSIZE, mf->width / 3);
++	else
++		regmap_write(gasket, DISP_MIX_GASKET_0_HSIZE, mf->width);
+ 	regmap_write(gasket, DISP_MIX_GASKET_0_VSIZE, mf->height);
+ }
+ 
+diff --git a/include/uapi/linux/media-bus-format.h b/include/uapi/linux/media-bus-format.h
+index 024efccdd5b9..159542de31e2 100644
+--- a/include/uapi/linux/media-bus-format.h
++++ b/include/uapi/linux/media-bus-format.h
+@@ -162,7 +162,8 @@
+ /* JPEG compressed formats - next is	0x4002 */
+ #define MEDIA_BUS_FMT_JPEG_1X8			0x4001
+ 
+-/* Vendor specific formats - next is	0x5002 */
++/* Vendor specific formats - next is	0x5003 */
++#define MEDIA_BUS_FMT_CUSTOM        		0x5002
+ 
+ /* S5C73M3 sensor specific interleaved UYVY and JPEG */
+ #define MEDIA_BUS_FMT_S5C_UYVY_JPEG_1X8		0x5001
