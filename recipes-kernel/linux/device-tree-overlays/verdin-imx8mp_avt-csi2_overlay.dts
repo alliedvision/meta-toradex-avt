@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright 2025 Alliede Vision Technologies GmbH
+ * Copyright 2025 Allied Vision Technologies GmbH
  */
+
+/dts-v1/;
+/plugin/;
 
 #define AVT_LINK_FREQUENCY 		    681250000
 #define CSI_ASSIGNED_CLOCK_RATES	500000000
